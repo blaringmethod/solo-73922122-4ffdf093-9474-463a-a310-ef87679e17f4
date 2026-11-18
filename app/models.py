@@ -60,3 +60,49 @@ class JobOut(BaseModel):
     @staticmethod
     def utcnow() -> datetime:
         return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# POST /sql/field-impact 字段影响分析
+# ---------------------------------------------------------------------------
+
+class FieldImpactRequest(BaseModel):
+    sql: str = Field(
+        ..., min_length=1,
+        description="一条只读 SELECT（限定语法：单层 CTE、内连接、WHERE、GROUP BY、SUM/COUNT）",
+    )
+    source_fields: list[str] = Field(
+        ..., min_length=1,
+        description="待评估的源字段，使用“表名.列名”，表名仅限 readings / meters",
+    )
+
+
+class RowsetDependency(BaseModel):
+    field: str = Field(..., description="追溯到的源字段，表名.列名")
+    reason: Literal[
+        "filter", "join", "group",
+        "cte_filter", "cte_join", "cte_group",
+    ]
+    detail: str
+
+
+class AffectedOutputColumn(BaseModel):
+    output_name: str
+    value_dependency: list[str] = Field(
+        default_factory=list,
+        description="值依赖：源字段直接流入该结果列取值表达式",
+    )
+    rowset_dependency: list[RowsetDependency] = Field(
+        default_factory=list,
+        description="结果集合依赖：筛选/连接/分组（含 CTE 转名追溯）影响行集合",
+    )
+
+
+class FieldImpactResponse(BaseModel):
+    sql: str
+    requested_fields: list[str]
+    affected_output_columns: list[AffectedOutputColumn]
+    not_referenced: list[str] = Field(
+        default_factory=list,
+        description="请求了但整条查询未引用到的源字段",
+    )

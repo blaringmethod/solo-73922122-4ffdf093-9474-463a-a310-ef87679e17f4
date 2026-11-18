@@ -86,3 +86,27 @@ ON CONFLICT DO NOTHING;
 -- ) baseline
 -- GROUP BY line_name, hr
 -- ORDER BY line_name, hr;
+
+-- ============================================================
+-- POST /sql/field-impact 示例（在 /docs 中直接发请求）
+-- 场景：准备改动 readings 源字段，评估日结查询的结果列影响。
+-- 该查询覆盖单层 CTE 转名、内连接、WHERE、GROUP BY、SUM/COUNT。
+-- 请求体（source_fields 用“表名.列名”）：
+-- {
+--   "sql": "WITH d AS (
+--       SELECT r.meter_id AS mid, r.wh AS w
+--       FROM readings r
+--       WHERE r.read_time >= TIMESTAMPTZ '2026-11-15 00:00:00+00'
+--     )
+--     SELECT m.line_name AS line_name, d.mid AS meter_id,
+--            SUM(d.w) AS wh_total, COUNT(*) AS cnt
+--     FROM d INNER JOIN meters m ON m.meter_id = d.mid
+--     GROUP BY m.line_name, d.mid",
+--   "source_fields": ["readings.wh", "readings.read_time",
+--                     "readings.meter_id", "meters.line_name"]
+-- }
+-- 预期：wh_total 值依赖 readings.wh；所有结果列都带
+--   readings.read_time 的 cte_filter（CTE 内 WHERE 转名追溯）、
+--   两侧 meter_id 的 join 与 group 结果集合依赖；
+--   COUNT(*) 的 cnt 无值依赖，仅有结果集合依赖。
+-- ============================================================

@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,14 @@ _OID_TO_TYPE = {
 
 class DbError(RuntimeError):
     pass
+
+
+class SchemaUnavailableError(DbError):
+    """无法取得一致表结构（锁等待超时 / 序列化失败等），不得发布影响结论。"""
+
+
+class QueryInvalidError(DbError):
+    """在一致表结构下核对，用户 SQL 对当前数据库无效（未知列 / 未知表等）。"""
 
 
 @dataclass
@@ -228,3 +237,130 @@ def _validate_row_types(rows: list[tuple], columns: list[ColumnMeta]) -> None:
                 raise DbError(f"列 {meta.name!r} 期望 bigint，实际值 {value!r}")
             if meta.pg_type == "text" and not isinstance(value, str):
                 raise DbError(f"列 {meta.name!r} 期望 text，实际值 {value!r}")
+
+
+# 字段影响分析唯一允许的源表（小写逻辑名）
+SOURCE_TABLES = ("meters", "readings")
+
+
+@dataclass
+class ColumnInfo:
+    name: str
+    data_type: str          # information_schema 规范类型名，如 bigint / text / timestamp with time zone
+    is_nullable: bool
+
+
+def read_consistent_schema(
+    sql_text: str,
+    table_names: tuple[str, ...] = SOURCE_TABLES,
+) -> dict[str, list[ColumnInfo]]:
+    """在**同一张一致表结构视图**内完成目录读取与 SQL 有效性核对。
+
+    并发 ALTER 场景下的保证：
+    - 单连接、单事务，REPEATABLE READ 下对每个源表先 LOCK TABLE（ACCESS SHARE
+      会与 ACCESS EXCLUSIVE 冲突），随后读目录、跑 EXPLAIN；
+    - LOCK / 目录 / EXPLAIN 全部在该事务内完成。并发 ALTER 未提交时 LOCK 等待
+      （lock_timeout 到点 -> SchemaUnavailableError，不发布结论）；
+      ALTER 已提交则本事务在锁获取后看到的目录就是改后的同一版结构；
+    - EXPLAIN 后在同一事务内重读目录并比对结构指纹（列名/类型/可空性的
+      哈希），前后不一致即拒绝发布（锁 + RR 快照下两次必然一致，此为纵深复核）。
+
+    返回 {表名: [ColumnInfo, ...]}；SQL 在该结构下无效时抛 QueryInvalidError。
+    """
+    conn = _open_connection()
+    try:
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        try:
+            # 1) 锁源表：与并发 ALTER 的 ACCESS EXCLUSIVE 锁互斥，锁住后本事务
+            #    看到的表结构在整个事务内稳定
+            for table in table_names:
+                conn.execute(
+                    psycopg.sql.SQL("LOCK TABLE {} IN ACCESS SHARE MODE").format(
+                        psycopg.sql.Identifier(table)
+                    )
+                )
+
+            def _read_columns() -> dict[str, list[ColumnInfo]]:
+                out: dict[str, list[ColumnInfo]] = {}
+                for table in table_names:
+                    rows = conn.execute(
+                        "SELECT column_name, data_type, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() AND table_name = %s "
+                        "ORDER BY ordinal_position",
+                        (table,),
+                    ).fetchall()
+                    if not rows:
+                        raise SchemaUnavailableError(
+                            f"源表 {table} 在当前库中不存在，无法确认表结构"
+                        )
+                    out[table] = [
+                        ColumnInfo(name=r[0], data_type=r[1], is_nullable=(r[2] == "YES"))
+                        for r in rows
+                    ]
+                return out
+
+            def _fingerprint(sch: dict[str, list[ColumnInfo]]) -> str:
+                h = hashlib.sha256()
+                for table in table_names:
+                    for col in sch[table]:
+                        h.update(f"{table}.{col.name}.{col.data_type}.{col.is_nullable}|".encode())
+                return h.hexdigest()
+
+            # 2) 同一事务/同一快照内第一次读取目录并留指纹
+            schema = _read_columns()
+            fp_before = _fingerprint(schema)
+
+            # 3) 同一结构视图内核验 SQL 有效性；EXPLAIN 不实际执行、无副作用，
+            #    只读事务内即便规划器尝试规划也不能写入
+            try:
+                conn.execute(
+                    psycopg.sql.SQL("EXPLAIN {}").format(psycopg.sql.SQL(sql_text))
+                ).fetchall()
+            except psycopg.errors.UndefinedTable as exc:
+                raise QueryInvalidError(f"查询引用了不存在的表：{exc.diag.message_primary}") from exc
+            except psycopg.errors.UndefinedColumn as exc:
+                raise QueryInvalidError(f"查询引用了不存在的列：{exc.diag.message_primary}") from exc
+            except psycopg.errors.AmbiguousColumn as exc:
+                raise QueryInvalidError(f"查询存在歧义列：{exc.diag.message_primary}") from exc
+            except psycopg.errors.SyntaxError as exc:
+                raise QueryInvalidError(f"SQL 语法无效：{exc.diag.message_primary}") from exc
+            except psycopg.Error as exc:
+                # 锁超时 / 序列化失败 / 查询取消等：无法确认 -> 不发布
+                msg = exc.diag.message_primary or str(exc)
+                if isinstance(exc, (psycopg.errors.LockNotAvailable,
+                                    psycopg.errors.SerializationFailure,
+                                    psycopg.errors.QueryCanceled)):
+                    raise SchemaUnavailableError(
+                        f"无法在一致表结构下完成核对（{msg}），本次不发布影响结论"
+                    ) from exc
+                raise QueryInvalidError(f"SQL 在当前表结构下无效：{msg}") from exc
+
+            # 4) EXPLAIN 后在同一事务内重读目录并复核指纹：
+            #    锁 + RR 快照下两次必然一致；不一致说明无法确认 -> 拒绝发布
+            fp_after = _fingerprint(_read_columns())
+            if fp_before != fp_after:
+                raise SchemaUnavailableError(
+                    "核对前后读到的表结构指纹不一致，无法确认一致性，本次不发布影响结论"
+                )
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        else:
+            conn.execute("COMMIT")
+        return schema
+    except SchemaUnavailableError:
+        raise
+    except QueryInvalidError:
+        raise
+    except psycopg.errors.LockNotAvailable as exc:
+        raise SchemaUnavailableError(
+            "源表正被其他会话变更（锁等待超时），无法确认一致表结构，本次不发布影响结论"
+        ) from exc
+    except psycopg.Error as exc:
+        raise DbError(f"表结构核对失败：{exc}") from exc
+    finally:
+        _quiet_close(conn)

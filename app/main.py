@@ -5,9 +5,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from . import db as dbmod
+from .field_impact import FieldImpactError, analyze_field_impact
 from .manager import SlotBusyError, manager
-from .models import CreateJobRequest, JobOut
-from .sqlvalidation import SqlValidationError
+from .models import (
+    AffectedOutputColumn,
+    CreateJobRequest,
+    FieldImpactRequest,
+    FieldImpactResponse,
+    JobOut,
+    RowsetDependency,
+)
+from .sqlvalidation import SqlValidationError, validate_select
 
 app = FastAPI(
     title="电表日结 SQL 核对 API",
@@ -64,6 +72,59 @@ def cancel_job(job_id: str) -> JobOut:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     return job.snapshot()
+
+
+@app.post(
+    "/sql/field-impact",
+    response_model=FieldImpactResponse,
+    tags=["字段影响分析"],
+)
+def field_impact(payload: FieldImpactRequest) -> FieldImpactResponse:
+    """分析源字段改动会影响日结查询的哪些结果列。
+
+    流程：先做只读 SELECT 静态闸；再在**同一个一致表结构事务**内
+    （锁源表 + 同一快照读目录 + EXPLAIN 核对有效性 + 目录指纹复核）
+    完成静态血缘分析。无法确认表结构一致性时不发布任何影响结论。
+    """
+    # 1) 通用只读闸（与 /jobs 同一套，拒绝多语句/写操作/DDL 等）
+    try:
+        normalized = validate_select(payload.sql)
+    except SqlValidationError as exc:
+        raise HTTPException(status_code=400, detail=f"SQL 校验失败：{exc}") from exc
+
+    # 2) 一致表结构事务：读目录 + EXPLAIN 有效性核对（同一事务内完成）
+    try:
+        schema = dbmod.read_consistent_schema(normalized)
+    except dbmod.SchemaUnavailableError as exc:
+        # 无法确认一致表结构 -> 409，不发布影响结论
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+    except dbmod.QueryInvalidError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)}) from exc
+    except dbmod.DbError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)}) from exc
+
+    # 3) 静态血缘分析（名称解析全部基于上一步的一致目录）
+    try:
+        result = analyze_field_impact(normalized, payload.source_fields, schema)
+    except FieldImpactError as exc:
+        raise HTTPException(status_code=400, detail=f"字段影响分析拒绝：{exc}") from exc
+
+    return FieldImpactResponse(
+        sql=normalized,
+        requested_fields=result.requested_fields,
+        affected_output_columns=[
+            AffectedOutputColumn(
+                output_name=col.output_name,
+                value_dependency=col.value_dependency,
+                rowset_dependency=[
+                    RowsetDependency(field=r.field.canonical(), reason=r.reason, detail=r.detail)
+                    for r in col.rowset_dependency
+                ],
+            )
+            for col in result.output_columns
+        ],
+        not_referenced=result.not_referenced,
+    )
 
 
 @app.exception_handler(dbmod.DbError)
